@@ -1,8 +1,13 @@
-name: Release
+name: Release (API key notarization)
+
+# Parallel to release.yml — same pipeline, but uses an App Store Connect
+# Notary API key (.p8) instead of an app-specific password.
+# Triggers on a separate `release-api/*` tag prefix so the two workflows
+# don't both fire on the same push.
 
 on:
   push:
-    tags: ['release/*']
+    tags: ['release-api/*']
   workflow_dispatch:
     inputs:
       version:
@@ -37,8 +42,8 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ inputs.version }}"
           else
-            # github.ref_name is "release/X.Y.Z"
-            VERSION="${GITHUB_REF_NAME#release/}"
+            # github.ref_name is "release-api/X.Y.Z"
+            VERSION="${GITHUB_REF_NAME#release-api/}"
           fi
 
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
@@ -82,7 +87,6 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
           security set-keychain-settings -lut 21600 build.keychain
           rm /tmp/cert.p12
-          # Sanity: list signing identities found.
           security find-identity -p codesigning -v build.keychain
 
       - name: Archive
@@ -145,29 +149,39 @@ jobs:
           set -o pipefail
           exit "$XC"
 
-      - name: Notarize
+      - name: Notarize (API key)
         shell: bash
         env:
-          APPLE_ID:                    ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          MACOS_DEVELOPMENT_TEAM:      ${{ secrets.MACOS_DEVELOPMENT_TEAM }}
+          APPLE_API_KEY_ID:        ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID:     ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
         run: |
           set -euo pipefail
-          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$MACOS_DEVELOPMENT_TEAM" ]; then
-            echo "::error::Missing notarization secrets (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / MACOS_DEVELOPMENT_TEAM)"
+          if [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER_ID" ] || [ -z "$APPLE_API_KEY_P8_BASE64" ]; then
+            echo "::error::Missing notarization secrets (APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64)"
             exit 1
           fi
+
+          # Decode the .p8 key to a temporary file with restrictive perms.
+          KEY_DIR="$RUNNER_TEMP/notary_keys"
+          mkdir -p "$KEY_DIR"
+          KEY_PATH="$KEY_DIR/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
 
           # notarytool needs a zip/dmg/pkg container — not a raw .app bundle.
           ditto -c -k --keepParent build/export/TestRelease.app build/notarize.zip
 
           # Submit and wait. --wait blocks until Apple returns a final status.
           xcrun notarytool submit build/notarize.zip \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id  "$MACOS_DEVELOPMENT_TEAM" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
             --wait \
             --timeout 30m
+
+          # Always wipe the key, even if a later step fails.
+          rm -rf "$KEY_DIR"
 
           # Embed the notarization ticket directly into the .app so Gatekeeper
           # can verify it offline. Validate to confirm staple succeeded.
@@ -180,9 +194,6 @@ jobs:
           set -euo pipefail
           APP="build/export/TestRelease.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
-
-          # spctl checks the full Gatekeeper story: signed + notarized + stapled.
-          # type=execute is the right assessment for an .app bundle.
           spctl --assess --type execute --verbose=4 "$APP"
 
           GOT_VERSION=$(/usr/bin/defaults read "$PWD/$APP/Contents/Info.plist" CFBundleShortVersionString)
@@ -207,7 +218,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: TestRelease ${{ env.VERSION }}
+          name: TestRelease ${{ env.VERSION }} (api-notary)
           prerelease: ${{ env.IS_PRERELEASE }}
           draft: ${{ github.event_name == 'workflow_dispatch' }}
           files: build/TestRelease-${{ env.VERSION }}.zip
@@ -225,7 +236,7 @@ jobs:
         with:
           channel-id: ${{ env.SLACK_CHANNEL }}
           slack-message: |
-            🧪 TestRelease build: *${{ env.VERSION }}*${{ env.IS_PRERELEASE == 'true' && ' (pre-release)' || '' }}
+            🧪 TestRelease build (api-notary): *${{ env.VERSION }}*${{ env.IS_PRERELEASE == 'true' && ' (pre-release)' || '' }}
             Download: ${{ steps.release.outputs.url }}
             Tag: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
@@ -241,7 +252,7 @@ jobs:
           SUFFIX=""
           if [ "$IS_PRERELEASE" = "true" ]; then SUFFIX=" (pre-release)"; fi
           BODY=$(jq -n \
-            --arg text "🧪 TestRelease build: *${VERSION}*${SUFFIX}
+            --arg text "🧪 TestRelease build (api-notary): *${VERSION}*${SUFFIX}
           Download: ${RELEASE_URL}
           Tag: ${GITHUB_REF_NAME}
           Commit: ${GITHUB_SHA}" \
